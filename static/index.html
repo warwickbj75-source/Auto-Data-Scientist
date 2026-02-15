@@ -1,1 +1,569 @@
+<!DOCTYPE html>
 
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Auto Data Scientist</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fraunces:wght@300;400;500;600&family=DM+Mono:wght@400&display=swap" rel="stylesheet" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.7/Recharts.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0c12; color: #e8eaed; font-family: 'Inter', -apple-system, sans-serif; }
+input, button { font-family: inherit; }
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #12141f; }
+::-webkit-scrollbar-thumb { background: #2a2d3e; border-radius: 3px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.fade-in { animation: fadeIn 0.3s ease; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback } = React;
+const { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, LineChart, Line, Legend, CartesianGrid } = Recharts;
+
+/* ─── API ─── */
+const api = {
+async _req(path, opts = {}) {
+const res = await fetch(`/api${path}`, { headers: { ‘Content-Type’: ‘application/json’, …opts.headers }, …opts });
+if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || res.statusText); }
+return res.json();
+},
+upload: async (file) => { const f = new FormData(); f.append(‘file’, file); const r = await fetch(’/api/upload’, { method: ‘POST’, body: f }); if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e.detail||‘Upload failed’); } return r.json(); },
+profile: (id) => api._req(`/profile/${id}`, { method: ‘POST’ }),
+config: (id, target, excluded=[], question=’’) => api._req(`/config/${id}`, { method: ‘POST’, body: JSON.stringify({ target, excluded, question }) }),
+explore: (id) => api._req(`/explore/${id}`, { method: ‘POST’ }),
+review: (id, decisions) => api._req(`/review/${id}`, { method: ‘POST’, body: JSON.stringify({ decisions }) }),
+train: (id) => api._req(`/model/${id}`, { method: ‘POST’ }),
+interpret: (id, useAi=false) => api._req(`/interpret/${id}`, { method: ‘POST’, body: JSON.stringify({ use_ai: useAi }) }),
+predict: (mid, inputs) => api._req(`/predict/${mid}`, { method: ‘POST’, body: JSON.stringify({ inputs }) }),
+whatIf: (mid, inputs) => api._req(`/predict/${mid}/what-if`, { method: ‘POST’, body: JSON.stringify({ inputs }) }),
+models: () => api._req(’/models’),
+model: (id) => api._req(`/models/${id}`),
+reset: () => api._req(’/session’, { method: ‘DELETE’ }),
+};
+
+/* ─── Theme ─── */
+const C = { bg:”#0a0c12”, card:”#12141f”, bdr:”#1c1f2e”, srf:”#181b28”, acc:”#4f6df5”, cyan:”#22d3ee”, grn:”#22c55e”, red:”#ef4444”, amb:”#f59e0b”, prp:”#a78bfa”, t1:”#e8eaed”, t2:”#8b8fa4”, t3:”#50546a”, grd:”#1e2133” };
+const TT = { background:C.card, border:`1px solid ${C.bdr}`, borderRadius:6, fontSize:11, color:C.t1 };
+const fmt = s => s ? s.replace(/_/g,’ ’).replace(/\b\w/g, c=>c.toUpperCase()) : ‘’;
+
+const Card = ({children, style, onClick}) => <div onClick={onClick} className=“fade-in” style={{background:C.card, border:`1px solid ${C.bdr}`, borderRadius:8, padding:16, …style}}>{children}</div>;
+const Btn = ({children, onClick, v=“p”, disabled, style}) => {
+const s = {p:{background:C.acc,color:”#fff”,border:“none”},s:{background:“transparent”,color:C.t3,border:`1px solid ${C.bdr}`},g:{background:C.grn,color:”#fff”,border:“none”}};
+return <button onClick={onClick} disabled={disabled} style={{padding:“9px 20px”,borderRadius:6,fontSize:12,fontWeight:600,cursor:disabled?“not-allowed”:“pointer”,opacity:disabled?.5:1,…(s[v]||s.p),…style}}>{children}</button>;
+};
+const Badge = ({children, color}) => <span style={{fontSize:8,fontWeight:700,padding:“2px 7px”,borderRadius:3,background:`${color}18`,color,fontFamily:“monospace”,textTransform:“uppercase”,letterSpacing:1}}>{children}</span>;
+const Loading = ({text}) => <div style={{display:“flex”,alignItems:“center”,gap:10,padding:20}}><div style={{width:18,height:18,border:`2px solid ${C.acc}`,borderTop:“2px solid transparent”,borderRadius:“50%”,animation:“spin 1s linear infinite”}}/><span style={{fontSize:13,color:C.t2}}>{text||“Processing…”}</span></div>;
+const Err = ({msg}) => <div style={{padding:12,borderRadius:6,background:`${C.red}15`,color:C.red,fontSize:12,marginTop:8}}>{msg}</div>;
+
+const STEPS = [
+{label:“Data Upload”,icon:“📁”,kind:“human”},{label:“Business Question”,icon:“🎯”,kind:“human”},
+{label:“Auto-Profile”,icon:“📊”,kind:“auto”},{label:“Auto-Explore”,icon:“🔍”,kind:“auto”},
+{label:“Human Review”,icon:“👤”,kind:“human”},{label:“Auto-Model”,icon:“⚙️”,kind:“auto”},
+{label:“Auto-Interpret”,icon:“📋”,kind:“auto”},{label:“Production”,icon:“🚀”,kind:“auto”},
+];
+
+/* ═══ STEP 0: UPLOAD ═══ */
+function StepUpload({onComplete}) {
+const [drag, setDrag] = useState(false);
+const [loading, setLoading] = useState(false);
+const [preview, setPreview] = useState(null);
+const [error, setError] = useState(null);
+
+const handle = async (file) => {
+setLoading(true); setError(null);
+try { setPreview(await api.upload(file)); } catch(e) { setError(e.message); }
+setLoading(false);
+};
+
+if (loading) return <Loading text="Uploading and parsing dataset..."/>;
+if (preview) return <div className="fade-in">
+<Card style={{marginBottom:14,borderLeft:`3px solid ${C.grn}`}}>
+<div style={{display:“flex”,alignItems:“center”,gap:10}}>
+<span style={{fontSize:24}}>✓</span>
+<div><div style={{fontSize:14,fontWeight:600,color:C.t1}}>{preview.name}</div>
+<div style={{fontSize:11,color:C.t3}}>{preview.rows.toLocaleString()} rows × {preview.cols} columns</div></div>
+</div>
+</Card>
+<Card style={{marginBottom:14}}>
+<div style={{fontSize:12,fontWeight:600,color:C.t1,marginBottom:8}}>Schema</div>
+<div style={{maxHeight:280,overflowY:“auto”}}>
+<table style={{width:“100%”,borderCollapse:“collapse”,fontSize:11}}>
+<thead><tr style={{borderBottom:`1px solid ${C.bdr}`}}>
+{[“Column”,“Type”,“Missing”].map(h=><th key={h} style={{padding:“5px 8px”,textAlign:“left”,color:C.t3,fontSize:9,textTransform:“uppercase”,fontFamily:“monospace”}}>{h}</th>)}
+</tr></thead>
+<tbody>{preview.columns.map((c,i)=><tr key={i} style={{borderBottom:`1px solid ${C.bdr}15`}}>
+<td style={{padding:“4px 8px”,color:C.t1,fontFamily:“monospace”}}>{c.name}</td>
+<td style={{padding:“4px 8px”}}><Badge color={c.dtype.includes(“float”)||c.dtype.includes(“int”)?C.acc:C.prp}>{c.dtype}</Badge></td>
+<td style={{padding:“4px 8px”,color:c.missing>0?C.red:C.t3,fontFamily:“monospace”}}>{c.missing}</td>
+</tr>)}</tbody>
+</table>
+</div>
+</Card>
+<div style={{display:“flex”,gap:10}}>
+<Btn v=“s” onClick={()=>setPreview(null)}>← Different File</Btn>
+<Btn v=“g” onClick={()=>onComplete(preview)}>Dataset Loaded — Next →</Btn>
+</div>
+
+  </div>;
+
+return <div>
+<div style={{fontSize:12,color:C.t2,lineHeight:1.6,marginBottom:16}}>Upload a CSV file to begin analysis.</div>
+<div onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);if(e.dataTransfer.files[0])handle(e.dataTransfer.files[0])}}
+style={{border:`2px dashed ${drag?C.acc:C.bdr}`,borderRadius:12,padding:“48px 24px”,textAlign:“center”,background:drag?`${C.acc}08`:“transparent”,transition:“all .2s”}}>
+<div style={{fontSize:36,marginBottom:12}}>📁</div>
+<div style={{fontSize:14,fontWeight:600,color:C.t1,marginBottom:4}}>Drag & drop your CSV here</div>
+<div style={{fontSize:12,color:C.t3,marginBottom:16}}>or tap to browse</div>
+<label style={{padding:“8px 20px”,borderRadius:6,background:C.acc,color:”#fff”,fontSize:12,fontWeight:600,cursor:“pointer”}}>
+Browse Files <input type=“file” accept=”.csv,.tsv” onChange={e=>{if(e.target.files[0])handle(e.target.files[0])}} style={{display:“none”}}/>
+</label>
+</div>
+{error && <Err msg={error}/>}
+
+  </div>;
+}
+
+/* ═══ STEP 1: QUESTION ═══ */
+function StepQuestion({datasetId, onComplete, onProfile}) {
+const [target, setTarget] = useState(null);
+const [question, setQuestion] = useState(””);
+const [loading, setLoading] = useState(true);
+const [profileData, setProfileData] = useState(null);
+const [saving, setSaving] = useState(false);
+
+useEffect(()=>{
+api.profile(datasetId).then(d=>{setProfileData(d);onProfile(d);setLoading(false)}).catch(()=>setLoading(false));
+},[datasetId]);
+
+const confirm = async () => {
+setSaving(true);
+try { await api.config(datasetId, target, [], question); onComplete({target,question}); } catch(e){}
+setSaving(false);
+};
+
+if (loading) return <Loading text="Analysing dataset for target candidates..."/>;
+if (saving) return <Loading text="Saving configuration..."/>;
+const cands = profileData?.target_candidates || [];
+
+return <div className="fade-in">
+<div style={{fontSize:12,color:C.t2,lineHeight:1.6,marginBottom:16}}>What do you want to predict? Choose a numeric target variable.</div>
+<div style={{marginBottom:14}}>
+<div style={{fontSize:10,color:C.t3,marginBottom:4,fontFamily:“monospace”,textTransform:“uppercase”,letterSpacing:1}}>Describe your question (optional)</div>
+<input value={question} onChange={e=>setQuestion(e.target.value)} placeholder=“e.g. What drives customer satisfaction?”
+style={{width:“100%”,padding:“8px 12px”,background:C.srf,border:`1px solid ${C.bdr}`,borderRadius:6,color:C.t1,fontSize:12}}/>
+</div>
+<div style={{fontSize:10,color:C.t3,marginBottom:6,fontFamily:“monospace”,textTransform:“uppercase”,letterSpacing:1}}>Target variable</div>
+<div style={{display:“grid”,gridTemplateColumns:“1fr 1fr”,gap:8,marginBottom:16}}>
+{cands.map(c=><Card key={c.column} onClick={()=>setTarget(c.column)} style={{cursor:“pointer”,border:`1px solid ${target===c.column?C.acc:C.bdr}`,background:target===c.column?`${C.acc}0a`:C.card,padding:14}}>
+<div style={{display:“flex”,justifyContent:“space-between”,alignItems:“center”}}>
+<div style={{fontSize:13,fontWeight:600,color:C.t1}}>{c.column}</div>
+<div style={{width:16,height:16,borderRadius:“50%”,border:`2px solid ${target===c.column?C.acc:C.bdr}`,display:“flex”,alignItems:“center”,justifyContent:“center”}}>
+{target===c.column && <div style={{width:7,height:7,borderRadius:“50%”,background:C.acc}}/>}
+</div>
+</div>
+<div style={{fontSize:10,color:C.t3,marginTop:4}}>Range: {c.range} · Mean: {c.mean}</div>
+</Card>)}
+</div>
+{target && <Btn v="g" onClick={confirm}>Confirm Target: {target} →</Btn>}
+
+  </div>;
+}
+
+/* ═══ STEP 2: PROFILE ═══ */
+function StepProfile({profileData}) {
+if (!profileData) return <div style={{color:C.t3}}>No profile data yet</div>;
+const s = profileData.summary;
+const dists = profileData.distributions;
+const cats = profileData.categoricals;
+const flags = profileData.quality_flags;
+const corr = profileData.correlations;
+const gc = v => Math.abs(v)<.1 ? C.bg : v>.3 ? C.acc : v>0 ? “#1E3A5F” : v>-.3 ? “#7C2D12” : C.red;
+const colors = [C.acc,C.grn,C.amb,C.prp,C.cyan,C.red];
+
+return <div className="fade-in">
+<div style={{display:“grid”,gridTemplateColumns:`repeat(${Math.min(6,3+Object.keys(s.type_counts).length)},1fr)`,gap:1,background:C.bdr,borderRadius:8,overflow:“hidden”,marginBottom:16}}>
+{[{l:“Rows”,v:s.rows.toLocaleString()},{l:“Columns”,v:s.columns},{l:“Missing”,v:s.missing_total},…Object.entries(s.type_counts).map(([k,v])=>({l:fmt(k),v}))].slice(0,6).map((m,i)=>
+<div key={i} style={{background:C.card,padding:12,textAlign:“center”}}><div style={{fontSize:18,fontWeight:700,color:C.t1}}>{m.v}</div><div style={{fontSize:8,color:C.t3,textTransform:“uppercase”,letterSpacing:1}}>{m.l}</div></div>
+)}
+</div>
+{Object.keys(dists).length>0 && <Card style={{marginBottom:14}}>
+<div style={{fontSize:12,fontWeight:600,color:C.t1,marginBottom:10}}>Distributions</div>
+<div style={{display:“grid”,gridTemplateColumns:“repeat(3,1fr)”,gap:8}}>
+{Object.entries(dists).slice(0,9).map(([col,d])=><div key={col} style={{padding:8,background:C.bg,borderRadius:6}}>
+<div style={{fontSize:10,fontWeight:600,color:C.t2,marginBottom:4}}>{fmt(col)}</div>
+<ResponsiveContainer width="100%" height={50}><BarChart data={d.counts.map((c,i)=>({v:c}))} margin={{top:0,right:0,bottom:0,left:0}}><Bar dataKey="v" fill={C.acc} fillOpacity={0.6} radius={[2,2,0,0]}/></BarChart></ResponsiveContainer>
+<div style={{display:“flex”,justifyContent:“space-between”,fontSize:8,color:C.t3,marginTop:2}}><span>μ={d.mean}</span><span>σ={d.std}</span><span>skew={d.skew}</span></div>
+</div>)}
+</div>
+</Card>}
+{Object.keys(cats).length>0 && <div style={{display:“grid”,gridTemplateColumns:`repeat(${Math.min(3,Object.keys(cats).length)},1fr)`,gap:8,marginBottom:14}}>
+{Object.entries(cats).slice(0,6).map(([name,info])=>{const vals=info.values;const tot=Object.values(vals).reduce((a,b)=>a+b,0);
+return <Card key={name} style={{padding:12}}><div style={{fontSize:11,fontWeight:600,color:C.t1,marginBottom:6}}>{fmt(name)}</div>
+<div style={{display:“flex”,gap:2,height:18,borderRadius:4,overflow:“hidden”,marginBottom:4}}>
+{Object.entries(vals).map(([k,v],i)=><div key={k} style={{flex:v,background:colors[i%6],display:“flex”,alignItems:“center”,justifyContent:“center”,fontSize:8,color:”#fff”,fontWeight:600}}>{(v/tot*100).toFixed(0)}%</div>)}
+</div>
+<div style={{display:“flex”,flexWrap:“wrap”,gap:6}}>{Object.keys(vals).slice(0,5).map((k,i)=><div key={k} style={{display:“flex”,alignItems:“center”,gap:3}}><div style={{width:5,height:5,borderRadius:1,background:colors[i%6]}}/><span style={{fontSize:8,color:C.t2}}>{k}</span></div>)}</div>
+</Card>})}
+</div>}
+{corr.cols?.length>0 && <Card style={{marginBottom:14}}>
+<div style={{fontSize:12,fontWeight:600,color:C.t1,marginBottom:8}}>Correlation Matrix</div>
+<div style={{overflowX:“auto”}}><div style={{display:“inline-block”}}>
+<div style={{display:“flex”,marginLeft:55}}>{corr.cols.map(c=><div key={c} style={{width:24,textAlign:“center”,fontSize:6,color:C.t3,transform:“rotate(-50deg)”,height:30,display:“flex”,alignItems:“flex-end”,justifyContent:“center”,fontFamily:“monospace”}}>{c}</div>)}</div>
+{corr.matrix.map((row,i)=><div key={i} style={{display:“flex”,alignItems:“center”}}>
+<div style={{width:55,fontSize:7,color:C.t2,textAlign:“right”,paddingRight:4,fontFamily:“monospace”}}>{corr.cols[i]}</div>
+{row.map((v,j)=><div key={j} style={{width:24,height:24,background:gc(v),display:“flex”,alignItems:“center”,justifyContent:“center”,fontSize:5,color:Math.abs(v)>=.3?”#fff”:“transparent”,fontWeight:600,borderRadius:1,margin:.5,fontFamily:“monospace”}}>{v.toFixed(2)}</div>)}
+</div>)}
+</div></div>
+</Card>}
+{flags.length>0 && <Card style={{borderLeft:`3px solid ${C.amb}`}}>
+<div style={{fontSize:12,fontWeight:600,color:C.amb,marginBottom:6}}>Quality Flags</div>
+{flags.map((f,i)=><div key={i} style={{fontSize:11,color:C.t2,lineHeight:1.5,paddingLeft:10,borderLeft:`2px solid ${f.severity==="high"?C.red:f.severity==="medium"?C.amb:C.t3}33`,marginBottom:4}}>
+<strong style={{color:C.t1}}>{f.message}</strong>{f.detail && <span style={{color:C.t3}}> — {f.detail}</span>}
+</div>)}
+</Card>}
+
+  </div>;
+}
+
+/* ═══ STEP 3: EXPLORE ═══ */
+function StepExplore({datasetId, onData}) {
+const [data, setData] = useState(null);
+const [loading, setLoading] = useState(true);
+useEffect(()=>{api.explore(datasetId).then(d=>{setData(d);onData(d);setLoading(false)}).catch(()=>setLoading(false))},[datasetId]);
+if (loading) return <Loading text="Computing feature importance and segments..."/>;
+if (!data) return <Err msg="Exploration failed"/>;
+const imp = data.feature_importance||[];
+const segs = data.segments?.segments||[];
+const sc = [C.red,C.amb,C.acc,C.grn,C.prp,C.cyan];
+
+return <div className="fade-in">
+<Card style={{marginBottom:14}}>
+<div style={{fontSize:13,fontWeight:600,color:C.t1,marginBottom:4}}>Feature Importance — {data.target}</div>
+<div style={{fontSize:10,color:C.t3,marginBottom:10}}>Random Forest + Gradient Boosting averaged</div>
+<ResponsiveContainer width="100%" height={Math.max(160,imp.length*26)}>
+<BarChart data={imp.slice(0,12)} layout="vertical" margin={{left:130,right:20}}>
+<XAxis type=“number” tick={{fill:C.t3,fontSize:10}} axisLine={{stroke:C.grd}} tickFormatter={v=>`${v}%`}/>
+<YAxis dataKey="feature" type="category" tick={{fill:C.t2,fontSize:10}} axisLine={false} tickLine={false} width={125} tickFormatter={fmt}/>
+<Tooltip contentStyle={TT} formatter={v=>[`${v}%`]}/>
+<Bar dataKey="importance" radius={[0,4,4,0]}>{imp.slice(0,12).map((d,i)=><Cell key={i} fill={i<2?C.acc:`${C.acc}55`}/>)}</Bar>
+</BarChart>
+</ResponsiveContainer>
+</Card>
+{segs.length>0 && <div>
+<div style={{fontSize:12,fontWeight:600,color:C.t1,marginBottom:8}}>Segments</div>
+<div style={{display:“grid”,gridTemplateColumns:`repeat(${Math.min(4,segs.length)},1fr)`,gap:8}}>
+{segs.map((s,i)=><Card key={i} style={{borderTop:`3px solid ${sc[i%6]}`,padding:12}}>
+<div style={{fontSize:9,color:sc[i%6],fontWeight:700,textTransform:“uppercase”,letterSpacing:1,fontFamily:“monospace”}}>{s.label}</div>
+<div style={{fontSize:16,fontWeight:700,color:C.t1,margin:“4px 0”}}>{s.count} <span style={{fontSize:10,color:C.t3,fontWeight:400}}>({s.pct}%)</span></div>
+<div style={{fontSize:10,color:C.t2}}>Avg {data.target}: <strong style={{color:C.t1}}>{s.target_mean}</strong></div>
+</Card>)}
+</div>
+</div>}
+
+  </div>;
+}
+
+/* ═══ STEP 4: HUMAN REVIEW ═══ */
+function StepReview({datasetId, claims, onComplete}) {
+const [dec, setDec] = useState({});
+const [loading, setLoading] = useState(false);
+const all = claims.length>0 && Object.keys(dec).length===claims.length;
+
+const submit = async () => {
+setLoading(true);
+try { onComplete(await api.review(datasetId, dec)); } catch(e){}
+setLoading(false);
+};
+if (loading) return <Loading text="Applying overrides..."/>;
+
+const bs = (id,type) => {
+const cols={agree:C.grn,challenge:C.red,investigate:C.amb}; const on=dec[id]===type;
+return {padding:“4px 10px”,border:`1px solid ${on?cols[type]:C.bdr}`,borderRadius:4,cursor:“pointer”,fontSize:10,fontWeight:600,background:on?`${cols[type]}22`:“transparent”,color:on?cols[type]:C.t3};
+};
+return <div className="fade-in">
+<div style={{fontSize:12,color:C.t2,lineHeight:1.6,marginBottom:14}}>Review each AI claim. <strong style={{color:C.grn}}>Agree</strong>, <strong style={{color:C.red}}>Challenge</strong>, or <strong style={{color:C.amb}}>Investigate</strong>.</div>
+{claims.map(c=><Card key={c.id} style={{marginBottom:8,borderLeft:`3px solid ${dec[c.id]==="agree"?C.grn:dec[c.id]==="challenge"?C.red:dec[c.id]==="investigate"?C.amb:C.bdr}`}}>
+<div style={{display:“flex”,justifyContent:“space-between”,alignItems:“flex-start”,flexWrap:“wrap”,gap:8}}>
+<div style={{flex:1,minWidth:200}}><div style={{fontSize:12,fontWeight:600,color:C.t1,marginBottom:2}}>{c.claim}</div><div style={{fontSize:9,color:C.t3}}>Risk: {c.risk}</div></div>
+<div style={{display:“flex”,gap:3}}>{[“agree”,“challenge”,“investigate”].map(t=><button key={t} onClick={()=>setDec(p=>({…p,[c.id]:t}))} style={bs(c.id,t)}>{fmt(t)}</button>)}</div>
+</div>
+</Card>)}
+{all && <div style={{marginTop:14}}><Btn v="g" onClick={submit}>Apply — Proceed to Modelling →</Btn></div>}
+
+  </div>;
+}
+
+/* ═══ STEP 5: MODEL ═══ */
+function StepModel({datasetId, onData}) {
+const [data, setData] = useState(null);
+const [loading, setLoading] = useState(true);
+useEffect(()=>{api.train(datasetId).then(d=>{setData(d);onData(d);setLoading(false)}).catch(()=>setLoading(false))},[datasetId]);
+if (loading) return <Loading text="Training 9 algorithms — this may take a moment..."/>;
+if (!data) return <Err msg="Training failed"/>;
+const lb = data.leaderboard||[];
+const best = data.best_model||{};
+
+return <div className="fade-in">
+<Card style={{marginBottom:14,borderLeft:`3px solid ${C.grn}`,background:`${C.grn}08`}}>
+<div style={{display:“flex”,alignItems:“center”,gap:8,flexWrap:“wrap”}}>
+<Badge color={C.grn}>WINNER</Badge>
+<span style={{fontSize:13,color:C.t1,fontWeight:600}}>{best.name}</span>
+<span style={{fontSize:12,color:C.t2}}>R² = {(best.r2/100).toFixed(3)} · MAE = {best.mae}</span>
+</div>
+{data.excluded?.length>0 && <div style={{marginTop:6,fontSize:10,color:C.amb}}>Excluded: {data.excluded.join(”, “)}</div>}
+</Card>
+<Card style={{marginBottom:14}}>
+<div style={{fontSize:12,fontWeight:600,color:C.t1,marginBottom:8}}>Model Leaderboard</div>
+<ResponsiveContainer width="100%" height={Math.max(200,lb.length*30)}>
+<BarChart data={lb} layout="vertical" margin={{left:110,right:20}}>
+<CartesianGrid strokeDasharray="3 3" stroke={C.grd} horizontal={false}/>
+<XAxis type=“number” domain={[0,100]} tick={{fill:C.t3,fontSize:10}} axisLine={{stroke:C.grd}} tickFormatter={v=>`${v}%`}/>
+<YAxis dataKey="name" type="category" tick={{fill:C.t2,fontSize:11}} axisLine={false} tickLine={false} width={105}/>
+<Tooltip contentStyle={TT} formatter={v=>[`${v}%`]}/><Legend wrapperStyle={{fontSize:10}}/>
+<Bar dataKey="r2" fill={C.acc} name="Test R²" radius={[0,3,3,0]} fillOpacity={0.85}/>
+<Bar dataKey="cv_mean" fill={C.cyan} name="CV R²" radius={[0,3,3,0]} fillOpacity={0.5}/>
+</BarChart>
+</ResponsiveContainer>
+</Card>
+<Card>
+<div style={{fontSize:12,fontWeight:600,color:C.t1,marginBottom:8}}>Metrics</div>
+<div style={{overflowX:“auto”}}><table style={{width:“100%”,borderCollapse:“collapse”,fontSize:11}}>
+<thead><tr style={{borderBottom:`1px solid ${C.bdr}`}}>{[“Model”,“R²”,“CV R²”,“MAE”,“RMSE”].map(h=><th key={h} style={{padding:“5px 8px”,textAlign:“left”,color:C.t3,fontSize:9,fontFamily:“monospace”,textTransform:“uppercase”}}>{h}</th>)}</tr></thead>
+<tbody>{lb.map((m,i)=><tr key={i} style={{borderBottom:`1px solid ${C.bdr}15`,background:i===0?`${C.grn}08`:“transparent”}}>
+<td style={{padding:“5px 8px”,fontWeight:600,color:C.t1}}>{m.name}{i===0&&” ★”}</td>
+<td style={{padding:“5px 8px”,color:C.t1,fontFamily:“monospace”}}>{(m.r2/100).toFixed(4)}</td>
+<td style={{padding:“5px 8px”,color:C.t2,fontFamily:“monospace”}}>{(m.cv_mean/100).toFixed(4)}</td>
+<td style={{padding:“5px 8px”,color:C.t2,fontFamily:“monospace”}}>{m.mae}</td>
+<td style={{padding:“5px 8px”,color:C.t2,fontFamily:“monospace”}}>{m.rmse}</td>
+</tr>)}</tbody>
+</table></div>
+</Card>
+
+  </div>;
+}
+
+/* ═══ STEP 6: INTERPRET ═══ */
+function StepInterpret({datasetId}) {
+const [rpt, setRpt] = useState(null);
+const [loading, setLoading] = useState(true);
+const [pg, setPg] = useState(“exec”);
+useEffect(()=>{api.interpret(datasetId).then(d=>{setRpt(d);setLoading(false)}).catch(()=>setLoading(false))},[datasetId]);
+if (loading) return <Loading text="Generating interpretation report..."/>;
+if (!rpt) return <Err msg="Report generation failed"/>;
+const L={bg:”#FAFAF9”,card:”#FFF”,bdr:”#E7E5E4”,t1:”#1C1917”,t2:”#57534E”,t3:”#A8A29E”,blue:”#1D4ED8”,green:”#15803D”,red:”#B91C1C”,amber:”#B45309”};
+const LC=({children,style})=><div style={{background:L.card,border:`1px solid ${L.bdr}`,borderRadius:6,padding:16,boxShadow:“0 1px 3px rgba(0,0,0,.04)”,…style}}>{children}</div>;
+const PG=[[“exec”,“Summary”],[“findings”,“Findings”],[“recs”,“Recommendations”],[“risks”,“Risks”],[“method”,“Methodology”]];
+
+return <div style={{background:L.bg,margin:-18,padding:0,borderRadius:8}}>
+<div style={{borderBottom:`1px solid ${L.bdr}`,padding:“12px 20px”,background:”#fff”}}><div style={{fontSize:14,fontWeight:500,color:L.t1,fontFamily:”‘Fraunces’,serif”}}>Analysis Report</div></div>
+<div style={{borderBottom:`1px solid ${L.bdr}`,padding:“0 20px”,background:”#fff”,display:“flex”,flexWrap:“wrap”}}>{PG.map(([k,label])=><button key={k} onClick={()=>setPg(k)} style={{padding:“9px 12px”,border:“none”,cursor:“pointer”,fontSize:11,fontWeight:500,background:“transparent”,color:pg===k?L.t1:L.t3,borderBottom:pg===k?`2px solid ${L.t1}`:“2px solid transparent”}}>{label}</button>)}</div>
+<div style={{padding:“18px 20px”}}>
+{pg===“exec” && <div>
+<div style={{borderBottom:`3px solid ${L.t1}`,paddingBottom:16,marginBottom:18}}><h2 style={{fontSize:17,fontWeight:300,color:L.t1,lineHeight:1.4,margin:0,fontFamily:”‘Fraunces’,serif”}}>{rpt.central_finding}</h2></div>
+<div style={{display:“grid”,gridTemplateColumns:`repeat(${Math.min(4,rpt.metrics.length)},1fr)`,gap:1,background:L.bdr,borderRadius:6,overflow:“hidden”}}>
+{rpt.metrics.map((m,i)=><div key={i} style={{background:L.card,padding:14,textAlign:“center”}}><div style={{fontSize:20,fontWeight:300,color:L.blue,fontFamily:”‘Fraunces’,serif”}}>{m.value}</div><div style={{fontSize:9,fontWeight:600,color:L.t3,textTransform:“uppercase”}}>{m.label}</div><div style={{fontSize:8,color:L.t3}}>{m.detail}</div></div>)}
+</div>
+</div>}
+{pg===“findings” && <div>{(rpt.findings||[]).map((f,i)=><div key={i} style={{marginBottom:18}}>
+<h3 style={{fontSize:15,fontWeight:400,color:L.t1,margin:“0 0 6px”,fontFamily:”‘Fraunces’,serif”}}>{f.title}</h3>
+<p style={{fontSize:12,color:L.t2,lineHeight:1.7,margin:“0 0 8px”}}>{f.text}</p>
+{f.implication && <LC style={{background:”#F8FAFC”,borderLeft:`3px solid ${L.blue}`}}><div style={{fontSize:11,fontWeight:600,color:L.t1,marginBottom:3}}>Implication</div><div style={{fontSize:11,color:L.t2}}>{f.implication}</div></LC>}
+</div>)}</div>}
+{pg===“recs” && <div>{(rpt.recommendations||[]).map((r,i)=><LC key={i} style={{marginBottom:10,borderLeft:`4px solid ${r.priority==="HIGH"?L.red:r.priority==="MEDIUM"?L.amber:L.t3}`}}>
+<Badge color={r.priority===“HIGH”?L.red:r.priority===“MEDIUM”?L.amber:L.t3}>{r.priority}</Badge>
+<div style={{fontSize:13,fontWeight:500,color:L.t1,fontFamily:”‘Fraunces’,serif”,marginTop:4}}>{r.title}</div>
+<div style={{fontSize:11,color:L.t2,marginTop:4,lineHeight:1.6}}>{r.description}</div>
+</LC>)}</div>}
+{pg===“risks” && <div>{(rpt.risks||[]).map((r,i)=><LC key={i} style={{marginBottom:8,borderLeft:`4px solid ${r.severity==="HIGH"?L.red:r.severity==="MEDIUM"?L.amber:L.t3}`}}>
+<div style={{display:“flex”,gap:8,alignItems:“center”,marginBottom:4}}><Badge color={r.severity===“HIGH”?L.red:r.severity===“MEDIUM”?L.amber:L.t3}>{r.severity}</Badge><span style={{fontSize:12,fontWeight:500,color:L.t1}}>{r.title}</span></div>
+<div style={{fontSize:11,color:L.t2,lineHeight:1.7}}>{r.body}</div>
+</LC>)}</div>}
+{pg===“method” && <div>{(rpt.methodology||[]).map((b,i)=><LC key={i} style={{marginBottom:10}}>
+<div style={{fontSize:10,fontWeight:700,color:L.blue,textTransform:“uppercase”,letterSpacing:1.5,marginBottom:8,fontFamily:“monospace”}}>{b.section}</div>
+{b.items.map((item,j)=><div key={j} style={{display:“flex”,gap:6,marginBottom:4}}><div style={{width:4,height:4,borderRadius:“50%”,background:L.t3,marginTop:6,flexShrink:0}}/><div style={{fontSize:11,color:L.t2,lineHeight:1.5}}>{item}</div></div>)}
+</LC>)}</div>}
+</div>
+
+  </div>;
+}
+
+/* ═══ STEP 7: PRODUCTION ═══ */
+function StepProduction({modelId, features}) {
+const [inputs, setInputs] = useState({});
+const [pred, setPred] = useState(null);
+const [whats, setWhats] = useState([]);
+const [loading, setLoading] = useState(false);
+
+useEffect(()=>{const d={};(features||[]).forEach(f=>{d[f]=0});setInputs(d)},[features]);
+
+const run = async () => {
+setLoading(true);
+try { const [p,w] = await Promise.all([api.predict(modelId,inputs),api.whatIf(modelId,inputs)]); setPred(p); setWhats(w); } catch(e){}
+setLoading(false);
+};
+const set = (k,v) => setInputs(p=>({…p,[k]:v}));
+
+return <div className=“fade-in” style={{display:“grid”,gridTemplateColumns:“280px 1fr”,gap:14}}>
+<Card>
+<div style={{fontSize:12,fontWeight:600,color:C.t1,marginBottom:10}}>Inputs</div>
+<div style={{maxHeight:380,overflowY:“auto”}}>
+{(features||[]).map(f=><div key={f} style={{marginBottom:8}}>
+<div style={{fontSize:10,color:C.t2,marginBottom:2}}>{fmt(f)}</div>
+<input type=“number” value={inputs[f]||0} onChange={e=>set(f,parseFloat(e.target.value)||0)} style={{width:“100%”,padding:“4px 8px”,background:C.bg,border:`1px solid ${C.bdr}`,borderRadius:4,color:C.t1,fontSize:11,fontFamily:“monospace”}}/>
+</div>)}
+</div>
+<Btn onClick={run} disabled={loading} style={{width:“100%”,marginTop:10}}>{loading?“Predicting…”:“Run Prediction”}</Btn>
+</Card>
+<div>
+{pred && <Card style={{marginBottom:12,borderLeft:`4px solid ${C.grn}`}}>
+<div style={{display:“flex”,alignItems:“center”,gap:8,marginBottom:10}}><Badge color={C.grn}>PREDICTION</Badge><span style={{fontSize:10,color:C.t3}}>{pred.algorithm}</span></div>
+<div style={{fontSize:42,fontWeight:700,color:C.t1,textAlign:“center”}}>{pred.prediction}</div>
+<div style={{fontSize:10,color:C.t3,textAlign:“center”}}>±{pred.mae} MAE</div>
+</Card>}
+{pred?.contributions?.length>0 && <Card style={{marginBottom:12}}>
+<div style={{fontSize:12,fontWeight:600,color:C.t1,marginBottom:8}}>Score Breakdown</div>
+<ResponsiveContainer width="100%" height={Math.max(80,pred.contributions.length*22)}>
+<BarChart data={pred.contributions.slice(0,10)} layout="vertical" margin={{left:120,right:20}}>
+<CartesianGrid strokeDasharray="3 3" stroke={C.grd} horizontal={false}/>
+<XAxis type="number" tick={{fill:C.t3,fontSize:9}} axisLine={{stroke:C.grd}}/>
+<YAxis dataKey="feature" type="category" tick={{fill:C.t2,fontSize:10}} axisLine={false} tickLine={false} width={115} tickFormatter={fmt}/>
+<Tooltip contentStyle={TT} formatter={v=>[v.toFixed(2),“Points”]}/>
+<Bar dataKey="value" radius={[0,3,3,0]}>{pred.contributions.slice(0,10).map((d,i)=><Cell key={i} fill={d.value>=0?C.grn:C.red} fillOpacity={0.7}/>)}</Bar>
+</BarChart>
+</ResponsiveContainer>
+</Card>}
+{whats.length>0 && <Card>
+<div style={{fontSize:12,fontWeight:600,color:C.t1,marginBottom:8}}>What-If Scenarios</div>
+<div style={{display:“grid”,gridTemplateColumns:“1fr 1fr”,gap:6}}>
+{whats.map((w,i)=><div key={i} style={{display:“flex”,alignItems:“center”,gap:8,padding:“6px 8px”,background:C.bg,borderRadius:4}}>
+<span style={{flex:1,fontSize:10,color:C.t2}}>{w.label}</span>
+<span style={{fontSize:13,fontWeight:700,color:w.delta>=0?C.grn:C.red,fontFamily:“monospace”}}>{w.delta>=0?”+”:””}{w.delta}</span>
+</div>)}
+</div>
+</Card>}
+{!pred && <div style={{padding:40,textAlign:“center”,color:C.t3,fontSize:13}}>Set inputs and tap “Run Prediction”</div>}
+</div>
+
+  </div>;
+}
+
+/* ═══ QUICK PREDICT ═══ */
+function QuickPredict({onBack}) {
+const [models, setModels] = useState([]);
+const [meta, setMeta] = useState(null);
+const [loading, setLoading] = useState(true);
+useEffect(()=>{api.models().then(m=>{setModels(m);setLoading(false)}).catch(()=>setLoading(false))},[]);
+
+if (loading) return <Loading text="Loading saved models..."/>;
+if (meta) return <div style={{padding:20}}>
+<div style={{display:“flex”,justifyContent:“space-between”,alignItems:“center”,marginBottom:16,flexWrap:“wrap”,gap:8}}>
+<div><div style={{fontSize:16,fontWeight:700,color:C.t1}}>Quick Predict — {meta.algorithm}</div><div style={{fontSize:11,color:C.t3}}>Target: {meta.target} · R²={meta.performance.r2}%</div></div>
+<Btn v=“s” onClick={()=>setMeta(null)}>← Models</Btn>
+</div>
+<StepProduction modelId={meta.model_id} features={meta.features}/>
+
+  </div>;
+
+return <div style={{padding:20}}>
+<div style={{display:“flex”,justifyContent:“space-between”,alignItems:“center”,marginBottom:16,flexWrap:“wrap”,gap:8}}>
+<div style={{fontSize:16,fontWeight:700,color:C.t1}}>Saved Models</div>
+<Btn v="s" onClick={onBack}>← New Analysis</Btn>
+</div>
+{models.length===0 ? <Card style={{textAlign:“center”,padding:40}}><div style={{fontSize:14,color:C.t2}}>No saved models yet. Run a pipeline first.</div></Card>
+: <div style={{display:“grid”,gap:8}}>{models.map(m=><Card key={m.model_id} onClick={async()=>{setMeta(await api.model(m.model_id))}} style={{cursor:“pointer”}}>
+<div style={{display:“flex”,justifyContent:“space-between”,alignItems:“center”,flexWrap:“wrap”,gap:8}}>
+<div><div style={{fontSize:13,fontWeight:600,color:C.t1}}>{m.dataset_name}</div><div style={{fontSize:10,color:C.t3}}>Target: {m.target} · {m.algorithm}</div><div style={{fontSize:9,color:C.t3}}>{new Date(m.created_at).toLocaleString()}</div></div>
+<div style={{textAlign:“right”}}><div style={{fontSize:20,fontWeight:700,color:C.acc}}>{(m.r2/100).toFixed(2)}</div><div style={{fontSize:8,color:C.t3,textTransform:“uppercase”}}>R²</div></div>
+</div>
+</Card>)}</div>}
+
+  </div>;
+}
+
+/* ═══ MAIN APP ═══ */
+function App() {
+const [mode, setMode] = useState(“home”);
+const [si, setSi] = useState(0);
+const [mx, setMx] = useState(0);
+const [dsId, setDsId] = useState(null);
+const [dsName, setDsName] = useState(null);
+const [profile, setProfile] = useState(null);
+const [exploration, setExploration] = useState(null);
+const [training, setTraining] = useState(null);
+const [config, setConfig] = useState({});
+const [review, setReview] = useState(null);
+
+const go = i => { setSi(i); setMx(p=>Math.max(p,i)); };
+const reset = () => { setSi(0);setMx(0);setDsId(null);setDsName(null);setProfile(null);setExploration(null);setTraining(null);setConfig({});setReview(null);api.reset().catch(()=>{}); };
+
+if (mode===“home”) return <div style={{background:C.bg,minHeight:“100vh”,color:C.t1,fontFamily:”‘Inter’,-apple-system,sans-serif”,display:“flex”,alignItems:“center”,justifyContent:“center”}}>
+<div style={{textAlign:“center”,maxWidth:500,padding:20}}>
+<div style={{fontSize:48,marginBottom:16}}>🔬</div>
+<h1 style={{fontSize:28,fontWeight:700,margin:“0 0 8px”}}>Auto Data Scientist</h1>
+<p style={{fontSize:14,color:C.t2,lineHeight:1.6,margin:“0 0 32px”}}>Upload any CSV. Get profiling, exploration, modelling, and predictions — with human oversight at every step.</p>
+<div style={{display:“flex”,gap:12,justifyContent:“center”,flexWrap:“wrap”}}>
+<Btn onClick={()=>setMode(“pipeline”)} style={{padding:“14px 32px”,fontSize:14}}>New Analysis</Btn>
+<Btn v=“s” onClick={()=>setMode(“predict”)} style={{padding:“14px 32px”,fontSize:14}}>Quick Predict</Btn>
+</div>
+</div>
+
+  </div>;
+
+if (mode===“predict”) return <div style={{background:C.bg,minHeight:“100vh”,color:C.t1,fontFamily:”‘Inter’,-apple-system,sans-serif”}}><QuickPredict onBack={()=>setMode(“home”)}/></div>;
+
+return <div style={{background:C.bg,minHeight:“100vh”,color:C.t1,fontFamily:”‘Inter’,-apple-system,sans-serif”,display:“flex”}}>
+{/* Sidebar */}
+<div style={{width:210,borderRight:`1px solid ${C.bdr}`,padding:“14px 0”,flexShrink:0,display:“flex”,flexDirection:“column”,overflowY:“auto”}}>
+<div style={{padding:“0 12px 12px”,borderBottom:`1px solid ${C.bdr}`}}><div style={{fontSize:14,fontWeight:700}}>Auto Data Scientist</div><div style={{fontSize:10,color:C.t3}}>Production v1.0</div></div>
+<div style={{padding:“8px 0”,flex:1}}>
+{STEPS.map((step,i)=>{const on=si===i;const past=si>i;const lock=i>mx+1;return <button key={i} onClick={()=>!lock&&go(i)} style={{display:“flex”,alignItems:“center”,gap:8,width:“100%”,padding:“7px 12px”,border:“none”,cursor:lock?“default”:“pointer”,background:on?`${C.acc}15`:“transparent”,borderLeft:on?`3px solid ${C.acc}`:“3px solid transparent”,opacity:lock?.3:1}}>
+<div style={{width:20,height:20,borderRadius:“50%”,display:“flex”,alignItems:“center”,justifyContent:“center”,fontSize:9,fontWeight:600,flexShrink:0,background:past?C.grn:on?C.acc:C.card,color:past||on?”#fff”:C.t3,border:`1.5px solid ${past?C.grn:on?C.acc:C.bdr}`}}>{past?“✓”:step.icon}</div>
+<div style={{textAlign:“left”}}><div style={{fontSize:10,fontWeight:on?600:400,color:on?C.t1:C.t2}}>{step.label}</div><div style={{fontSize:7,color:step.kind===“human”?C.amb:C.t3,textTransform:“uppercase”}}>{step.kind}</div></div>
+</button>})}
+</div>
+{(config.target||dsName) && <div style={{padding:“8px 12px”,borderTop:`1px solid ${C.bdr}`}}>
+<div style={{fontSize:8,color:C.acc,textTransform:“uppercase”,fontFamily:“monospace”}}>Config</div>
+{dsName && <div style={{fontSize:10,color:C.t2}}>File: <strong style={{color:C.t1}}>{dsName}</strong></div>}
+{config.target && <div style={{fontSize:10,color:C.t2}}>Target: <strong style={{color:C.t1}}>{config.target}</strong></div>}
+</div>}
+<div style={{padding:“8px 12px”,borderTop:`1px solid ${C.bdr}`}}>
+<button onClick={()=>{reset();setMode(“home”)}} style={{fontSize:10,color:C.t3,background:“none”,border:“none”,cursor:“pointer”,padding:0}}>← Home</button>
+</div>
+</div>
+{/* Main */}
+<div style={{flex:1,padding:“18px 22px”,overflowY:“auto”,maxHeight:“100vh”}}>
+<div style={{marginBottom:16,display:“flex”,alignItems:“center”,gap:8,flexWrap:“wrap”}}>
+<div style={{width:8,height:8,borderRadius:“50%”,background:STEPS[si].kind===“human”?C.amb:C.grn,boxShadow:`0 0 8px ${STEPS[si].kind==="human"?C.amb:C.grn}55`}}/>
+<span style={{fontSize:11,color:STEPS[si].kind===“human”?C.amb:C.grn,textTransform:“uppercase”,letterSpacing:1.5,fontFamily:“monospace”,fontWeight:600}}>Step {si} — {STEPS[si].label}</span>
+<Badge color={STEPS[si].kind===“human”?C.amb:C.grn}>{STEPS[si].kind}</Badge>
+</div>
+{si===0 && <StepUpload onComplete={p=>{setDsId(p.dataset_id);setDsName(p.name);go(1)}}/>}
+{si===1 && <StepQuestion datasetId={dsId} onProfile={setProfile} onComplete={cfg=>{setConfig(cfg);go(2)}}/>}
+{si===2 && <StepProfile profileData={profile}/>}
+{si===3 && <StepExplore datasetId={dsId} onData={setExploration}/>}
+{si===4 && <StepReview datasetId={dsId} claims={exploration?.claims||[]} onComplete={r=>{setReview(r);go(5)}}/>}
+{si===5 && <StepModel datasetId={dsId} onData={setTraining}/>}
+{si===6 && <StepInterpret datasetId={dsId}/>}
+{si===7 && <StepProduction modelId={training?.model_id} features={training?.features}/>}
+{si>0 && si!==4 && <div style={{display:“flex”,justifyContent:“space-between”,marginTop:18,paddingTop:12,borderTop:`1px solid ${C.bdr}`,flexWrap:“wrap”,gap:8}}>
+<Btn v=“s” onClick={()=>go(si-1)}>← Back</Btn>
+{si<7 ? <Btn onClick={()=>go(si+1)}>Next: {STEPS[si+1].label} →</Btn>
+: <div style={{padding:“8px 18px”,borderRadius:6,background:`${C.grn}15`,color:C.grn,fontSize:12,fontWeight:600}}>✓ Pipeline Complete</div>}
+</div>}
+</div>
+
+  </div>;
+}
+
+ReactDOM.createRoot(document.getElementById(‘root’)).render(React.createElement(App));
+</script>
+
+</body>
+</html>
