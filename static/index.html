@@ -1,22 +1,25 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Auto Data Scientist</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0c12;color:#e8eaed;font-family:-apple-system,sans-serif}
+</style>
 </head>
-<body style="background:#0a0c12;color:white;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">
-<div style="text-align:center">
-<h1>Auto Data Scientist</h1>
-<p>If you can see this, the server is working.</p>
-<p id="status">Checking API...</p>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script>
-fetch('/api/health').then(r=>r.json()).then(d=>{
-document.getElementById('status').textContent='API OK: '+JSON.stringify(d);
-}).catch(e=>{
-document.getElementById('status').textContent='API Error: '+e.message;
-});
+var e = React.createElement;
+var root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(e("div",{style:{textAlign:"center",padding:40}},
+  e("h1",null,"React is working!"),
+  e("p",{style:{color:"#888",marginTop:8}},"If you see this, React loaded fine on iPad.")
+));
 </script>
-</div>
 </body>
 </html>
