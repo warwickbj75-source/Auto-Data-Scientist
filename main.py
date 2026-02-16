@@ -349,8 +349,16 @@ async def serve_frontend():
 if os.path.exists(STATIC_DIR):
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-
-if __name__ == '__main__':
+@app.get("/static/app.js")
+async def serve_appjs():
+    import pathlib
+    from fastapi.responses import Response
+    js_path = pathlib.Path(__file__).parent / "static" / "app.js"
+    if js_path.exists():
+        return Response(content=js_path.read_text(), media_type="application/javascript")
+    return Response(content="// app.js not found", status_code=404) 
+    
+if __name__ == '__main__':\
     import uvicorn
     port = int(os.environ.get('PORT', 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
