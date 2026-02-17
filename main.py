@@ -1,356 +1,60 @@
-"""
-Auto Data Scientist — Production API
-Single-user local web app for automated data science pipelines.
-"""
-import os
-import json
-import uuid
-import shutil
-from datetime import datetime
-
-import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from typing import Optional
-
-from services.profiler import profile_dataset
-from services.explorer import explore_dataset
-from services.trainer import train_pipeline
-from services.interpreter import generate_generic_report, generate_ai_report
-from services.predictor import (
-    predict_single, predict_batch, compute_what_ifs,
-    list_models, get_model_metadata, delete_model
-)
-
-# --- App Setup ---
-app = FastAPI(title="Auto Data Scientist", version="1.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-BASE_DIR = os.path.dirname(__file__)
-UPLOADS_DIR = os.path.join(BASE_DIR, 'uploads')
-DATA_DIR = os.path.join(BASE_DIR, 'data')
-MODELS_DIR = os.path.join(BASE_DIR, 'models')
-os.makedirs(UPLOADS_DIR, exist_ok=True)
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(MODELS_DIR, exist_ok=True)
-
-# In-memory session state (single user)
-session = {
-    'datasets': {},      # dataset_id -> {path, name, profile, exploration}
-    'current': None,     # current dataset_id
-    'config': {},        # target, excluded, etc.
-    'review': {},        # human review decisions
-}
-
-
-# --- Pydantic Models ---
-class ConfigRequest(BaseModel):
-    target: str
-    excluded: list[str] = []
-    question: Optional[str] = None
-
-class ReviewRequest(BaseModel):
-    decisions: dict  # claim_id -> 'agree' | 'challenge' | 'investigate'
-
-class PredictRequest(BaseModel):
-    inputs: dict
-
-class InterpretRequest(BaseModel):
-    use_ai: bool = False
-    api_key: Optional[str] = None
-
-
-# --- Upload ---
-@app.post("/api/upload")
-async def upload_dataset(file: UploadFile = File(...)):
-    """Upload a CSV file and get a dataset ID + preview."""
-    if not file.filename.endswith(('.csv', '.tsv')):
-        raise HTTPException(400, "Only CSV/TSV files supported")
-
-    dataset_id = str(uuid.uuid4())[:8]
-    filepath = os.path.join(UPLOADS_DIR, f"{dataset_id}_{file.filename}")
-
-    with open(filepath, 'wb') as f:
-        content = await file.read()
-        f.write(content)
-
-    # Read and validate
-    try:
-        sep = '\t' if file.filename.endswith('.tsv') else ','
-        df = pd.read_csv(filepath, sep=sep)
-    except Exception as e:
-        os.remove(filepath)
-        raise HTTPException(400, f"Failed to parse file: {str(e)}")
-
-    if len(df) < 10:
-        os.remove(filepath)
-        raise HTTPException(400, "Dataset must have at least 10 rows")
-
-    # Store in session
-    session['datasets'][dataset_id] = {
-        'path': filepath,
-        'name': file.filename,
-        'rows': len(df),
-        'cols': len(df.columns),
-        'columns': list(df.columns),
-    }
-    session['current'] = dataset_id
-
-    # Quick preview
-    preview = {
-        'dataset_id': dataset_id,
-        'name': file.filename,
-        'rows': len(df),
-        'cols': len(df.columns),
-        'columns': [
-            {
-                'name': col,
-                'dtype': str(df[col].dtype),
-                'sample': str(df[col].dropna().iloc[:3].tolist()) if len(df[col].dropna()) > 0 else '[]',
-                'missing': int(df[col].isnull().sum()),
-            }
-            for col in df.columns
-        ],
-        'head': df.head(5).to_dict(orient='records'),
-    }
-
-    return preview
-
-
-# --- Profile ---
-@app.post("/api/profile/{dataset_id}")
-async def profile(dataset_id: str):
-    """Run full profiling on a dataset."""
-    ds = session['datasets'].get(dataset_id)
-    if not ds:
-        raise HTTPException(404, "Dataset not found")
-
-    df = pd.read_csv(ds['path'])
-    result = profile_dataset(df)
-
-    # Cache profile
-    session['datasets'][dataset_id]['profile'] = result
-    return result
-
-
-# --- Config ---
-@app.post("/api/config/{dataset_id}")
-async def set_config(dataset_id: str, config: ConfigRequest):
-    """Set target variable and exclusions."""
-    ds = session['datasets'].get(dataset_id)
-    if not ds:
-        raise HTTPException(404, "Dataset not found")
-
-    session['config'] = {
-        'target': config.target,
-        'excluded': config.excluded,
-        'question': config.question,
-        'dataset_id': dataset_id,
-    }
-
-    return {'status': 'ok', 'config': session['config']}
-
-
-# --- Explore ---
-@app.post("/api/explore/{dataset_id}")
-async def explore(dataset_id: str):
-    """Run exploration: feature importance, segments, claims."""
-    ds = session['datasets'].get(dataset_id)
-    if not ds:
-        raise HTTPException(404, "Dataset not found")
-
-    config = session.get('config', {})
-    target = config.get('target')
-    if not target:
-        raise HTTPException(400, "Set target variable first via /api/config")
-
-    df = pd.read_csv(ds['path'])
-    excluded = config.get('excluded', [])
-
-    result = explore_dataset(df, target, excluded)
-    session['datasets'][dataset_id]['exploration'] = result
-    return result
-
-
-# --- Human Review ---
-@app.post("/api/review/{dataset_id}")
-async def submit_review(dataset_id: str, review: ReviewRequest):
-    """Submit human review decisions on AI claims."""
-    session['review'] = review.decisions
-
-    # Auto-apply overrides: if user challenged a feature, exclude it
-    config = session.get('config', {})
-    exploration = session['datasets'].get(dataset_id, {}).get('exploration', {})
-    claims = exploration.get('claims', [])
-    excluded = list(config.get('excluded', []))
-
-    for claim in claims:
-        cid = claim['id']
-        if review.decisions.get(cid) == 'challenge':
-            # If the claim references a top feature, exclude it
-            if cid == 'top_feature':
-                imp = exploration.get('feature_importance', [])
-                if imp:
-                    feat = imp[0]['feature']
-                    if feat not in excluded:
-                        excluded.append(feat)
-
-    session['config']['excluded'] = excluded
-
-    return {
-        'status': 'ok',
-        'decisions': review.decisions,
-        'excluded': excluded,
-        'overrides': sum(1 for v in review.decisions.values() if v == 'challenge'),
-    }
-
-
-# --- Train ---
-@app.post("/api/model/{dataset_id}")
-async def train_model(dataset_id: str):
-    """Train models and save the best one."""
-    ds = session['datasets'].get(dataset_id)
-    if not ds:
-        raise HTTPException(404, "Dataset not found")
-
-    config = session.get('config', {})
-    target = config.get('target')
-    if not target:
-        raise HTTPException(400, "Set target variable first")
-
-    df = pd.read_csv(ds['path'])
-    excluded = config.get('excluded', [])
-
-    result = train_pipeline(df, target, excluded, dataset_name=ds['name'])
-    session['datasets'][dataset_id]['training'] = result
-    return result
-
-
-# --- Interpret ---
-@app.post("/api/interpret/{dataset_id}")
-async def interpret(dataset_id: str, req: InterpretRequest = InterpretRequest()):
-    """Generate interpretation report."""
-    ds = session['datasets'].get(dataset_id)
-    if not ds:
-        raise HTTPException(404, "Dataset not found")
-
-    profile_data = ds.get('profile', {})
-    exploration = ds.get('exploration', {})
-    training = ds.get('training', {})
-
-    if not training:
-        raise HTTPException(400, "Train a model first")
-
-    if req.use_ai:
-        result = generate_ai_report(profile_data, exploration, training, req.api_key)
-    else:
-        result = generate_generic_report(profile_data, exploration, training)
-
-    return result
-
-
-# --- Predict ---
-@app.post("/api/predict/{model_id}")
-async def predict(model_id: str, req: PredictRequest):
-    """Score a single data point."""
-    try:
-        result = predict_single(model_id, req.inputs)
-        return result
-    except FileNotFoundError:
-        raise HTTPException(404, f"Model {model_id} not found")
-
-
-@app.post("/api/predict/{model_id}/what-if")
-async def what_if(model_id: str, req: PredictRequest):
-    """Compute what-if scenarios."""
-    try:
-        result = compute_what_ifs(model_id, req.inputs)
-        return result
-    except FileNotFoundError:
-        raise HTTPException(404, f"Model {model_id} not found")
-
-
-# --- Model Registry ---
-@app.get("/api/models")
-async def get_models():
-    """List all saved models."""
-    return list_models()
-
-
-@app.get("/api/models/{model_id}")
-async def get_model(model_id: str):
-    """Get model details."""
-    try:
-        return get_model_metadata(model_id)
-    except FileNotFoundError:
-        raise HTTPException(404, f"Model {model_id} not found")
-
-
-@app.delete("/api/models/{model_id}")
-async def remove_model(model_id: str):
-    """Delete a saved model."""
-    if delete_model(model_id):
-        return {'status': 'deleted', 'model_id': model_id}
-    raise HTTPException(404, f"Model {model_id} not found")
-
-
-# --- Session ---
-@app.get("/api/session")
-async def get_session():
-    """Get current session state (for frontend)."""
-    return {
-        'current_dataset': session.get('current'),
-        'config': session.get('config', {}),
-        'review': session.get('review', {}),
-        'datasets': {
-            k: {kk: vv for kk, vv in v.items() if kk != 'path'}
-            for k, v in session['datasets'].items()
-        },
-    }
-
-
-@app.delete("/api/session")
-async def reset_session():
-    """Reset session (start over)."""
-    session['datasets'] = {}
-    session['current'] = None
-    session['config'] = {}
-    session['review'] = {}
-    return {'status': 'reset'}
-
-
-# --- Health ---
-@app.get("/api/health")
-async def health():
-    return {
-        'status': 'ok',
-        'models_saved': len(list_models()),
-        'timestamp': datetime.now().isoformat(),
-    }
-
-
-# --- Serve Frontend ---
-STATIC_DIR = os.path.join(BASE_DIR, 'static')
-
-@app.get("/")
-async def serve_frontend():
-    return FileResponse(os.path.join(STATIC_DIR, 'index.html'))
-
-
-# Serve static assets (must be after API routes)
-if os.path.exists(STATIC_DIR):
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-
-if __name__ == '__main__':
-    import uvicorn
-    port = int(os.environ.get('PORT', 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Auto Data Scientist</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fraunces:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0c12;color:#e8eaed;font-family:'Inter',-apple-system,sans-serif}
+input,button{font-family:inherit}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.fi{animation:fadeIn .3s ease}
+</style>
+</head>
+<body>
+<div id="root"><div style="display:flex;align-items:center;justify-content:center;min-height:100vh"><p>Loading...</p></div></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script>
+var e=React.createElement,h=React.useState,ue=React.useEffect;
+var C={bg:"#0a0c12",cd:"#12141f",bd:"#1c1f2e",sf:"#181b28",ac:"#4f6df5",cn:"#22d3ee",gn:"#22c55e",rd:"#ef4444",am:"#f59e0b",pp:"#a78bfa",t1:"#e8eaed",t2:"#8b8fa4",t3:"#50546a"};
+var api={
+  _r:function(p,o){o=o||{};return fetch("/api"+p,Object.assign({headers:{"Content-Type":"application/json"}},o)).then(function(r){if(!r.ok)return r.json().catch(function(){return{}}).then(function(err){throw new Error(err.detail||r.statusText)});return r.json()})},
+  upload:function(f){var d=new FormData();d.append("file",f);return fetch("/api/upload",{method:"POST",body:d}).then(function(r){if(!r.ok)return r.json().catch(function(){return{}}).then(function(err){throw new Error(err.detail||"Upload failed")});return r.json()})},
+  profile:function(id){return api._r("/profile/"+id,{method:"POST"})},
+  config:function(id,target,ex,q){return api._r("/config/"+id,{method:"POST",body:JSON.stringify({target:target,excluded:ex||[],question:q||""})})},
+  explore:function(id){return api._r("/explore/"+id,{method:"POST"})},
+  review:function(id,dec){return api._r("/review/"+id,{method:"POST",body:JSON.stringify({decisions:dec})})},
+  train:function(id){return api._r("/model/"+id,{method:"POST"})},
+  interpret:function(id){return api._r("/interpret/"+id,{method:"POST",body:JSON.stringify({use_ai:false})})},
+  predict:function(mid,inp){return api._r("/predict/"+mid,{method:"POST",body:JSON.stringify({inputs:inp})})},
+  whatIf:function(mid,inp){return api._r("/predict/"+mid+"/what-if",{method:"POST",body:JSON.stringify({inputs:inp})})},
+  models:function(){return api._r("/models")},
+  model:function(id){return api._r("/models/"+id)},
+  reset:function(){return api._r("/session",{method:"DELETE"})}
+};
+function fmt(s){return s?s.replace(/_/g," ").replace(/\b\w/g,function(c){return c.toUpperCase()}):""}
+function Card(p){return e("div",{onClick:p.onClick,className:"fi",style:Object.assign({background:C.cd,border:"1px solid "+C.bd,borderRadius:8,padding:16},p.style||{})},p.children)}
+function Btn(p){var s=p.v==="s"?{background:"transparent",color:C.t3,border:"1px solid "+C.bd}:p.v==="g"?{background:C.gn,color:"#fff",border:"none"}:{background:C.ac,color:"#fff",border:"none"};return e("button",{onClick:p.onClick,disabled:p.disabled,style:Object.assign({padding:"9px 20px",borderRadius:6,fontSize:12,fontWeight:600,cursor:p.disabled?"not-allowed":"pointer",opacity:p.disabled?0.5:1},s,p.style||{})},p.children)}
+function Badge(p){return e("span",{style:{fontSize:8,fontWeight:700,padding:"2px 7px",borderRadius:3,background:p.color+"18",color:p.color,fontFamily:"monospace",textTransform:"uppercase",letterSpacing:1}},p.children)}
+function Loading(p){return e("div",{style:{display:"flex",alignItems:"center",gap:10,padding:20}},e("div",{style:{width:18,height:18,border:"2px solid "+C.ac,borderTop:"2px solid transparent",borderRadius:"50%",animation:"spin 1s linear infinite"}}),e("span",{style:{fontSize:13,color:C.t2}},p.text||"Processing..."))}
+function Err(p){return e("div",{style:{padding:12,borderRadius:6,background:C.rd+"15",color:C.rd,fontSize:12,marginTop:8}},p.msg)}
+function SBar(p){var mx=p.maxVal||Math.max.apply(null,p.data.map(function(d){return d[p.vk]}).concat([1]));return e("div",{style:{display:"flex",flexDirection:"column",gap:4}},p.data.map(function(d,i){return e("div",{key:i,style:{display:"flex",alignItems:"center",gap:8}},e("div",{style:{width:120,fontSize:10,color:C.t2,textAlign:"right",flexShrink:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},fmt(d[p.lk])),e("div",{style:{flex:1,height:20,background:C.bg,borderRadius:3,overflow:"hidden"}},e("div",{style:{width:Math.max(2,d[p.vk]/mx*100)+"%",height:"100%",background:i<2?(p.color||C.ac):(p.color||C.ac)+"77",borderRadius:3}})),e("span",{style:{fontSize:10,color:C.t1,fontFamily:"monospace",minWidth:40}},d[p.vk]+(p.sx||"")))}))}
+var STEPS=[{l:"Data Upload",i:"\u{1F4C1}",k:"human"},{l:"Business Question",i:"\u{1F3AF}",k:"human"},{l:"Auto-Profile",i:"\u{1F4CA}",k:"auto"},{l:"Auto-Explore",i:"\u{1F50D}",k:"auto"},{l:"Human Review",i:"\u{1F464}",k:"human"},{l:"Auto-Model",i:"\u2699\uFE0F",k:"auto"},{l:"Auto-Interpret",i:"\u{1F4CB}",k:"auto"},{l:"Production",i:"\u{1F680}",k:"auto"}];
+function StepUpload(p){var st=h(false),ld=st[0],sld=st[1];var st2=h(null),pv=st2[0],spv=st2[1];var st3=h(null),er=st3[0],ser=st3[1];function go(f){sld(true);ser(null);api.upload(f).then(function(d){spv(d);sld(false)}).catch(function(x){ser(x.message);sld(false)})}if(ld)return e(Loading,{text:"Uploading..."});if(pv)return e("div",{className:"fi"},e(Card,{style:{marginBottom:14,borderLeft:"3px solid "+C.gn}},e("div",{style:{display:"flex",alignItems:"center",gap:10}},e("span",{style:{fontSize:24}},"\u2713"),e("div",null,e("div",{style:{fontSize:14,fontWeight:600,color:C.t1}},pv.name),e("div",{style:{fontSize:11,color:C.t3}},pv.rows.toLocaleString()+" rows \u00D7 "+pv.cols+" columns")))),e(Card,{style:{marginBottom:14}},e("div",{style:{fontSize:12,fontWeight:600,color:C.t1,marginBottom:8}},"Schema"),e("div",{style:{maxHeight:280,overflowY:"auto"}},pv.columns.map(function(c,i){return e("div",{key:i,style:{display:"flex",justifyContent:"space-between",padding:"4px 0",borderBottom:"1px solid "+C.bd+"22"}},e("span",{style:{fontSize:11,color:C.t1,fontFamily:"monospace"}},c.name),e("span",{style:{fontSize:10,color:C.t3}},c.dtype+(c.missing>0?" \u00B7 "+c.missing+" missing":"")))}))),e("div",{style:{display:"flex",gap:10}},e(Btn,{v:"s",onClick:function(){spv(null)}},"\u2190 Different File"),e(Btn,{v:"g",onClick:function(){p.onComplete(pv)}},"Loaded \u2014 Next \u2192")));return e("div",null,e("div",{style:{fontSize:12,color:C.t2,lineHeight:1.6,marginBottom:16}},"Upload a CSV file to begin analysis."),e("div",{style:{border:"2px dashed "+C.bd,borderRadius:12,padding:"48px 24px",textAlign:"center"}},e("div",{style:{fontSize:36,marginBottom:12}},"\u{1F4C1}"),e("div",{style:{fontSize:14,fontWeight:600,color:C.t1,marginBottom:16}},"Tap below to choose your CSV file"),e("label",{style:{padding:"10px 24px",borderRadius:6,background:C.ac,color:"#fff",fontSize:13,fontWeight:600,cursor:"pointer"}},"Choose File",e("input",{type:"file",accept:".csv,.tsv",onChange:function(ev){if(ev.target.files[0])go(ev.target.files[0])},style:{display:"none"}}))),er?e(Err,{msg:er}):null)}
+function StepQuestion(p){var s1=h(null),target=s1[0],sTarget=s1[1];var s2=h(""),question=s2[0],sQ=s2[1];var s3=h(true),ld=s3[0],sld=s3[1];var s4=h(null),prof=s4[0],sProf=s4[1];var s5=h(false),sav=s5[0],sSav=s5[1];ue(function(){api.profile(p.datasetId).then(function(d){sProf(d);p.onProfile(d);sld(false)}).catch(function(){sld(false)})},[]);if(ld)return e(Loading,{text:"Analysing dataset..."});if(sav)return e(Loading,{text:"Saving..."});var cands=prof&&prof.target_candidates?prof.target_candidates:[];return e("div",{className:"fi"},e("div",{style:{fontSize:12,color:C.t2,lineHeight:1.6,marginBottom:16}},"What do you want to predict? Choose a numeric target."),e("div",{style:{marginBottom:14}},e("input",{value:question,onChange:function(ev){sQ(ev.target.value)},placeholder:"Describe your question (optional)",style:{width:"100%",padding:"8px 12px",background:C.sf,border:"1px solid "+C.bd,borderRadius:6,color:C.t1,fontSize:12}})),e("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:16}},cands.map(function(c){return e(Card,{key:c.column,onClick:function(){sTarget(c.column)},style:{cursor:"pointer",border:"1px solid "+(target===c.column?C.ac:C.bd),background:target===c.column?C.ac+"0a":C.cd,padding:14}},e("div",{style:{fontSize:13,fontWeight:600,color:C.t1}},c.column),e("div",{style:{fontSize:10,color:C.t3,marginTop:4}},"Range: "+c.range+" Mean: "+c.mean))})),target?e(Btn,{v:"g",onClick:function(){sSav(true);api.config(p.datasetId,target,[],question).then(function(){p.onComplete({target:target,question:question})}).catch(function(){sSav(false)})}},"Confirm: "+target+" \u2192"):null)}
+function StepProfile(p){var d=p.profileData;if(!d)return e("div",{style:{color:C.t3}},"No profile data");var s=d.summary;var dists=d.distributions;var cats=d.categoricals;var flags=d.quality_flags;var cls=[C.ac,C.gn,C.am,C.pp,C.cn,C.rd];var stats=[{l:"Rows",v:s.rows.toLocaleString()},{l:"Columns",v:s.columns},{l:"Missing",v:s.missing_total}];Object.keys(s.type_counts).forEach(function(k){stats.push({l:fmt(k),v:s.type_counts[k]})});stats=stats.slice(0,6);return e("div",{className:"fi"},e("div",{style:{display:"grid",gridTemplateColumns:"repeat("+Math.min(4,stats.length)+",1fr)",gap:1,background:C.bd,borderRadius:8,overflow:"hidden",marginBottom:16}},stats.map(function(m,i){return e("div",{key:i,style:{background:C.cd,padding:12,textAlign:"center"}},e("div",{style:{fontSize:18,fontWeight:700,color:C.t1}},m.v),e("div",{style:{fontSize:8,color:C.t3,textTransform:"uppercase",letterSpacing:1}},m.l))})),Object.keys(dists).length>0?e(Card,{style:{marginBottom:14}},e("div",{style:{fontSize:12,fontWeight:600,color:C.t1,marginBottom:10}},"Distributions"),e("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}},Object.keys(dists).slice(0,9).map(function(col){var dd=dists[col];var mx=Math.max.apply(null,dd.counts.concat([1]));return e("div",{key:col,style:{padding:8,background:C.bg,borderRadius:6}},e("div",{style:{fontSize:10,fontWeight:600,color:C.t2,marginBottom:4}},fmt(col)),e("div",{style:{display:"flex",gap:1,height:40,alignItems:"flex-end"}},dd.counts.map(function(c,i){return e("div",{key:i,style:{flex:1,height:Math.max(2,c/mx*100)+"%",background:C.ac+"88",borderRadius:"2px 2px 0 0"}})})),e("div",{style:{display:"flex",justifyContent:"space-between",fontSize:8,color:C.t3,marginTop:2}},e("span",null,"m="+dd.mean),e("span",null,"s="+dd.std)))}))):null,Object.keys(cats).length>0?e("div",{style:{display:"grid",gridTemplateColumns:"repeat("+Math.min(3,Object.keys(cats).length)+",1fr)",gap:8,marginBottom:14}},Object.keys(cats).slice(0,6).map(function(name){var vals=cats[name].values;var tot=0;Object.keys(vals).forEach(function(k){tot+=vals[k]});return e(Card,{key:name,style:{padding:12}},e("div",{style:{fontSize:11,fontWeight:600,color:C.t1,marginBottom:6}},fmt(name)),e("div",{style:{display:"flex",gap:2,height:18,borderRadius:4,overflow:"hidden"}},Object.keys(vals).map(function(k,i){return e("div",{key:k,style:{flex:vals[k],background:cls[i%6],display:"flex",alignItems:"center",justifyContent:"center",fontSize:8,color:"#fff",fontWeight:600}},Math.round(vals[k]/tot*100)+"%")})))})):null,flags.length>0?e(Card,{style:{borderLeft:"3px solid "+C.am}},e("div",{style:{fontSize:12,fontWeight:600,color:C.am,marginBottom:6}},"Quality Flags"),flags.map(function(f,i){return e("div",{key:i,style:{fontSize:11,color:C.t2,lineHeight:1.5,paddingLeft:10,marginBottom:4}},e("strong",{style:{color:C.t1}},f.message))})):null)}
+function StepExplore(p){var s1=h(null),data=s1[0],sData=s1[1];var s2=h(true),ld=s2[0],sld=s2[1];ue(function(){api.explore(p.datasetId).then(function(d){sData(d);p.onData(d);sld(false)}).catch(function(){sld(false)})},[]);if(ld)return e(Loading,{text:"Computing feature importance..."});if(!data)return e(Err,{msg:"Exploration failed"});var imp=data.feature_importance||[];var segs=data.segments&&data.segments.segments?data.segments.segments:[];var sc=[C.rd,C.am,C.ac,C.gn,C.pp];return e("div",{className:"fi"},e(Card,{style:{marginBottom:14}},e("div",{style:{fontSize:13,fontWeight:600,color:C.t1,marginBottom:4}},"Feature Importance"),e("div",{style:{fontSize:10,color:C.t3,marginBottom:12}},"RF + Gradient Boosting averaged"),e(SBar,{data:imp.slice(0,12),lk:"feature",vk:"importance",color:C.ac,sx:"%"})),segs.length>0?e("div",null,e("div",{style:{fontSize:12,fontWeight:600,color:C.t1,marginBottom:8}},"Segments"),e("div",{style:{display:"grid",gridTemplateColumns:"repeat("+Math.min(4,segs.length)+",1fr)",gap:8}},segs.map(function(s,i){return e(Card,{key:i,style:{borderTop:"3px solid "+sc[i%5],padding:12}},e("div",{style:{fontSize:9,color:sc[i%5],fontWeight:700,textTransform:"uppercase",fontFamily:"monospace"}},s.label),e("div",{style:{fontSize:16,fontWeight:700,color:C.t1,margin:"4px 0"}},s.count+" ",e("span",{style:{fontSize:10,color:C.t3}},"("+s.pct+"%)")),e("div",{style:{fontSize:10,color:C.t2}},"Avg target: ",e("strong",{style:{color:C.t1}},s.target_mean)))}))):null)}
+function StepReview(p){var s1=h({}),dec=s1[0],sDec=s1[1];var s2=h(false),ld=s2[0],sld=s2[1];var claims=p.claims;var all=claims.length>0&&Object.keys(dec).length===claims.length;if(ld)return e(Loading,{text:"Applying..."});return e("div",{className:"fi"},e("div",{style:{fontSize:12,color:C.t2,lineHeight:1.6,marginBottom:14}},"Review each AI claim."),claims.map(function(c){return e(Card,{key:c.id,style:{marginBottom:8,borderLeft:"3px solid "+(dec[c.id]==="agree"?C.gn:dec[c.id]==="challenge"?C.rd:dec[c.id]==="investigate"?C.am:C.bd)}},e("div",{style:{marginBottom:6}},e("div",{style:{fontSize:12,fontWeight:600,color:C.t1}},c.claim),e("div",{style:{fontSize:9,color:C.t3}},"Risk: "+c.risk)),e("div",{style:{display:"flex",gap:4,flexWrap:"wrap"}},["agree","challenge","investigate"].map(function(t){var cols={agree:C.gn,challenge:C.rd,investigate:C.am};var on=dec[c.id]===t;return e("button",{key:t,onClick:function(){var nd=Object.assign({},dec);nd[c.id]=t;sDec(nd)},style:{padding:"5px 12px",border:"1px solid "+(on?cols[t]:C.bd),borderRadius:4,cursor:"pointer",fontSize:10,fontWeight:600,background:on?cols[t]+"22":"transparent",color:on?cols[t]:C.t3}},fmt(t))})))}),all?e("div",{style:{marginTop:14}},e(Btn,{v:"g",onClick:function(){sld(true);api.review(p.datasetId,dec).then(function(r){p.onComplete(r)}).catch(function(){sld(false)})}},"Proceed to Modelling \u2192")):null)}
+function StepModel(p){var s1=h(null),data=s1[0],sData=s1[1];var s2=h(true),ld=s2[0],sld=s2[1];ue(function(){api.train(p.datasetId).then(function(d){sData(d);p.onData(d);sld(false)}).catch(function(){sld(false)})},[]);if(ld)return e(Loading,{text:"Training 9 algorithms..."});if(!data)return e(Err,{msg:"Training failed"});var lb=data.leaderboard||[];var best=data.best_model||{};return e("div",{className:"fi"},e(Card,{style:{marginBottom:14,borderLeft:"3px solid "+C.gn,background:C.gn+"08"}},e("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}},e(Badge,{color:C.gn},"WINNER"),e("span",{style:{fontSize:13,color:C.t1,fontWeight:600}},best.name),e("span",{style:{fontSize:12,color:C.t2}},"R2="+(best.r2/100).toFixed(3)+" MAE="+best.mae))),e(Card,{style:{marginBottom:14}},e("div",{style:{fontSize:12,fontWeight:600,color:C.t1,marginBottom:8}},"Leaderboard"),e(SBar,{data:lb.map(function(m){return{name:m.name,r2:m.r2}}),lk:"name",vk:"r2",maxVal:100,color:C.ac,sx:"%"})),e(Card,null,e("div",{style:{fontSize:12,fontWeight:600,color:C.t1,marginBottom:8}},"Metrics"),lb.map(function(m,i){return e("div",{key:i,style:{display:"flex",justifyContent:"space-between",padding:"5px 0",borderBottom:"1px solid "+C.bd+"22",background:i===0?C.gn+"08":"transparent"}},e("span",{style:{fontSize:11,fontWeight:i===0?600:400,color:C.t1}},m.name+(i===0?" *":"")),e("span",{style:{fontSize:10,color:C.t2,fontFamily:"monospace"}},"R2="+(m.r2/100).toFixed(3)+" MAE="+m.mae))})))}
+function StepInterpret(p){var s1=h(null),rpt=s1[0],sRpt=s1[1];var s2=h(true),ld=s2[0],sld=s2[1];var s3=h("exec"),pg=s3[0],sPg=s3[1];ue(function(){api.interpret(p.datasetId).then(function(d){sRpt(d);sld(false)}).catch(function(){sld(false)})},[]);if(ld)return e(Loading,{text:"Generating report..."});if(!rpt)return e(Err,{msg:"Report failed"});var L={bg:"#FAFAF9",cd:"#FFF",bd:"#E7E5E4",t1:"#1C1917",t2:"#57534E",t3:"#A8A29E",bl:"#1D4ED8"};var PG=[["exec","Summary"],["findings","Findings"],["recs","Recs"],["risks","Risks"]];return e("div",{style:{background:L.bg,margin:-18,padding:0,borderRadius:8}},e("div",{style:{borderBottom:"1px solid "+L.bd,padding:"12px 20px",background:"#fff"}},e("div",{style:{fontSize:14,fontWeight:500,color:L.t1,fontFamily:"'Fraunces',serif"}},"Analysis Report")),e("div",{style:{borderBottom:"1px solid "+L.bd,padding:"0 20px",background:"#fff",display:"flex",flexWrap:"wrap"}},PG.map(function(x){return e("button",{key:x[0],onClick:function(){sPg(x[0])},style:{padding:"9px 12px",border:"none",cursor:"pointer",fontSize:11,fontWeight:500,background:"transparent",color:pg===x[0]?L.t1:L.t3,borderBottom:pg===x[0]?"2px solid "+L.t1:"2px solid transparent"}},x[1])})),e("div",{style:{padding:"18px 20px"}},pg==="exec"?e("div",null,e("h2",{style:{fontSize:16,fontWeight:300,color:L.t1,lineHeight:1.4,margin:"0 0 18px",fontFamily:"'Fraunces',serif",borderBottom:"3px solid "+L.t1,paddingBottom:16}},rpt.central_finding),e("div",{style:{display:"grid",gridTemplateColumns:"repeat("+Math.min(4,rpt.metrics.length)+",1fr)",gap:1,background:L.bd,borderRadius:6,overflow:"hidden"}},rpt.metrics.map(function(m,i){return e("div",{key:i,style:{background:L.cd,padding:14,textAlign:"center"}},e("div",{style:{fontSize:18,fontWeight:300,color:L.bl}},m.value),e("div",{style:{fontSize:9,fontWeight:600,color:L.t3,textTransform:"uppercase"}},m.label))}))):null,pg==="findings"?e("div",null,(rpt.findings||[]).map(function(f,i){return e("div",{key:i,style:{marginBottom:18,background:L.cd,border:"1px solid "+L.bd,borderRadius:6,padding:16}},e("h3",{style:{fontSize:14,fontWeight:500,color:L.t1,margin:"0 0 6px"}},f.title),e("p",{style:{fontSize:12,color:L.t2,lineHeight:1.7,margin:0}},f.text))})):null,pg==="recs"?e("div",null,(rpt.recommendations||[]).map(function(r,i){return e("div",{key:i,style:{background:L.cd,border:"1px solid "+L.bd,borderRadius:6,padding:16,marginBottom:10}},e(Badge,{color:r.priority==="HIGH"?"#B91C1C":"#B45309"},r.priority),e("div",{style:{fontSize:13,fontWeight:500,color:L.t1,marginTop:4}},r.title),e("div",{style:{fontSize:11,color:L.t2,marginTop:4}},r.description))})):null,pg==="risks"?e("div",null,(rpt.risks||[]).map(function(r,i){return e("div",{key:i,style:{background:L.cd,border:"1px solid "+L.bd,borderRadius:6,padding:16,marginBottom:8}},e(Badge,{color:r.severity==="HIGH"?"#B91C1C":"#B45309"},r.severity),e("div",{style:{fontSize:12,fontWeight:500,color:L.t1,marginTop:4}},r.title),e("div",{style:{fontSize:11,color:L.t2,marginTop:4}},r.body))})):null))}
+function StepProduction(p){var s1=h({}),inputs=s1[0],sInputs=s1[1];var s2=h(null),pred=s2[0],sPred=s2[1];var s3=h([]),whats=s3[0],sWhats=s3[1];var s4=h(false),ld=s4[0],sld=s4[1];ue(function(){var d={};(p.features||[]).forEach(function(f){d[f]=0});sInputs(d)},[p.features]);function run(){sld(true);Promise.all([api.predict(p.modelId,inputs),api.whatIf(p.modelId,inputs)]).then(function(r){sPred(r[0]);sWhats(r[1]);sld(false)}).catch(function(){sld(false)})}return e("div",{className:"fi"},e("div",{style:{display:"grid",gridTemplateColumns:"260px 1fr",gap:14}},e(Card,null,e("div",{style:{fontSize:12,fontWeight:600,color:C.t1,marginBottom:10}},"Inputs"),e("div",{style:{maxHeight:350,overflowY:"auto"}},(p.features||[]).map(function(f){return e("div",{key:f,style:{marginBottom:8}},e("div",{style:{fontSize:10,color:C.t2,marginBottom:2}},fmt(f)),e("input",{type:"number",value:inputs[f]||0,onChange:function(ev){var nd=Object.assign({},inputs);nd[f]=parseFloat(ev.target.value)||0;sInputs(nd)},style:{width:"100%",padding:"4px 8px",background:C.bg,border:"1px solid "+C.bd,borderRadius:4,color:C.t1,fontSize:11,fontFamily:"monospace"}}))})),e(Btn,{onClick:run,disabled:ld,style:{width:"100%",marginTop:10}},ld?"Predicting...":"Run Prediction")),e("div",null,pred?e(Card,{style:{marginBottom:12,borderLeft:"4px solid "+C.gn}},e("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:10}},e(Badge,{color:C.gn},"PREDICTION"),e("span",{style:{fontSize:10,color:C.t3}},pred.algorithm)),e("div",{style:{fontSize:42,fontWeight:700,color:C.t1,textAlign:"center"}},pred.prediction),e("div",{style:{fontSize:10,color:C.t3,textAlign:"center"}},"MAE: "+pred.mae)):null,pred&&pred.contributions&&pred.contributions.length>0?e(Card,{style:{marginBottom:12}},e("div",{style:{fontSize:12,fontWeight:600,color:C.t1,marginBottom:8}},"Score Breakdown"),pred.contributions.slice(0,10).map(function(d,i){return e("div",{key:i,style:{display:"flex",justifyContent:"space-between",padding:"3px 0"}},e("span",{style:{fontSize:10,color:C.t2}},fmt(d.feature)),e("span",{style:{fontSize:10,color:d.value>=0?C.gn:C.rd,fontFamily:"monospace"}},(d.value>=0?"+":"")+d.value.toFixed(2)))})):null,whats.length>0?e(Card,null,e("div",{style:{fontSize:12,fontWeight:600,color:C.t1,marginBottom:8}},"What-If Scenarios"),e("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}},whats.map(function(w,i){return e("div",{key:i,style:{display:"flex",justifyContent:"space-between",padding:"6px 8px",background:C.bg,borderRadius:4}},e("span",{style:{fontSize:10,color:C.t2}},w.label),e("span",{style:{fontSize:13,fontWeight:700,color:w.delta>=0?C.gn:C.rd,fontFamily:"monospace"}},(w.delta>=0?"+":"")+w.delta))}))):null,!pred?e("div",{style:{padding:40,textAlign:"center",color:C.t3}},"Set inputs and tap Run Prediction"):null)))}
+function QuickPredict(p){var s1=h([]),models=s1[0],sModels=s1[1];var s2=h(null),meta=s2[0],sMeta=s2[1];var s3=h(true),ld=s3[0],sld=s3[1];ue(function(){api.models().then(function(m){sModels(m);sld(false)}).catch(function(){sld(false)})},[]);if(ld)return e(Loading,{text:"Loading models..."});if(meta)return e("div",{style:{padding:20}},e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}},e("div",null,e("div",{style:{fontSize:16,fontWeight:700,color:C.t1}},"Quick Predict"),e("div",{style:{fontSize:11,color:C.t3}},meta.algorithm+" | "+meta.target)),e(Btn,{v:"s",onClick:function(){sMeta(null)}},"Back")),e(StepProduction,{modelId:meta.model_id,features:meta.features}));return e("div",{style:{padding:20}},e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}},e("div",{style:{fontSize:16,fontWeight:700,color:C.t1}},"Saved Models"),e(Btn,{v:"s",onClick:p.onBack},"New Analysis")),models.length===0?e(Card,{style:{textAlign:"center",padding:40}},e("div",{style:{fontSize:14,color:C.t2}},"No saved models yet.")):e("div",{style:{display:"grid",gap:8}},models.map(function(m){return e(Card,{key:m.model_id,onClick:function(){api.model(m.model_id).then(sMeta)},style:{cursor:"pointer"}},e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center"}},e("div",null,e("div",{style:{fontSize:13,fontWeight:600,color:C.t1}},m.dataset_name),e("div",{style:{fontSize:10,color:C.t3}},m.target+" | "+m.algorithm)),e("div",{style:{fontSize:20,fontWeight:700,color:C.ac}},(m.r2/100).toFixed(2))))})))}
+function App(){var s0=h("home"),mode=s0[0],sMode=s0[1];var s1=h(0),si=s1[0],sSi=s1[1];var s2=h(0),mx=s2[0],sMx=s2[1];var s3=h(null),dsId=s3[0],sDsId=s3[1];var s4=h(null),dsName=s4[0],sDsName=s4[1];var s5=h(null),profile=s5[0],sProfile=s5[1];var s6=h(null),exploration=s6[0],sExploration=s6[1];var s7=h(null),training=s7[0],sTraining=s7[1];var s8=h({}),config=s8[0],sConfig=s8[1];function go(i){sSi(i);sMx(function(p){return Math.max(p,i)})}function reset(){sSi(0);sMx(0);sDsId(null);sDsName(null);sProfile(null);sExploration(null);sTraining(null);sConfig({});api.reset().catch(function(){})}if(mode==="home")return e("div",{style:{background:C.bg,minHeight:"100vh",color:C.t1,fontFamily:"Inter,sans-serif",display:"flex",alignItems:"center",justifyContent:"center"}},e("div",{style:{textAlign:"center",maxWidth:500,padding:20}},e("div",{style:{fontSize:48,marginBottom:16}},"\u{1F52C}"),e("h1",{style:{fontSize:28,fontWeight:700,margin:"0 0 8px"}},"Auto Data Scientist"),e("p",{style:{fontSize:14,color:C.t2,lineHeight:1.6,margin:"0 0 32px"}},"Upload any CSV. Get profiling, exploration, modelling, and predictions."),e("div",{style:{display:"flex",gap:12,justifyContent:"center",flexWrap:"wrap"}},e(Btn,{onClick:function(){sMode("pipeline")},style:{padding:"14px 32px",fontSize:14}},"New Analysis"),e(Btn,{v:"s",onClick:function(){sMode("predict")},style:{padding:"14px 32px",fontSize:14}},"Quick Predict"))));if(mode==="predict")return e("div",{style:{background:C.bg,minHeight:"100vh",color:C.t1}},e(QuickPredict,{onBack:function(){sMode("home")}}));var curStep=STEPS[si];return e("div",{style:{background:C.bg,minHeight:"100vh",color:C.t1,fontFamily:"Inter,sans-serif",display:"flex"}},e("div",{style:{width:200,borderRight:"1px solid "+C.bd,padding:"14px 0",flexShrink:0,display:"flex",flexDirection:"column",overflowY:"auto"}},e("div",{style:{padding:"0 12px 12px",borderBottom:"1px solid "+C.bd}},e("div",{style:{fontSize:14,fontWeight:700}},"Auto Data Scientist"),e("div",{style:{fontSize:10,color:C.t3}},"v1.0")),e("div",{style:{padding:"8px 0",flex:1}},STEPS.map(function(step,i){var on=si===i;var past=si>i;var lock=i>mx+1;return e("button",{key:i,onClick:function(){if(!lock)go(i)},style:{display:"flex",alignItems:"center",gap:8,width:"100%",padding:"7px 12px",border:"none",cursor:lock?"default":"pointer",background:on?C.ac+"15":"transparent",borderLeft:on?"3px solid "+C.ac:"3px solid transparent",opacity:lock?0.3:1}},e("div",{style:{width:20,height:20,borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,fontWeight:600,flexShrink:0,background:past?C.gn:on?C.ac:C.cd,color:past||on?"#fff":C.t3,border:"1.5px solid "+(past?C.gn:on?C.ac:C.bd)}},past?"\u2713":step.i),e("div",{style:{textAlign:"left"}},e("div",{style:{fontSize:10,fontWeight:on?600:400,color:on?C.t1:C.t2}},step.l),e("div",{style:{fontSize:7,color:step.k==="human"?C.am:C.t3,textTransform:"uppercase"}},step.k)))})),config.target||dsName?e("div",{style:{padding:"8px 12px",borderTop:"1px solid "+C.bd}},dsName?e("div",{style:{fontSize:10,color:C.t2}},"File: "+dsName):null,config.target?e("div",{style:{fontSize:10,color:C.t2}},"Target: "+config.target):null):null,e("div",{style:{padding:"8px 12px",borderTop:"1px solid "+C.bd}},e("button",{onClick:function(){reset();sMode("home")},style:{fontSize:10,color:C.t3,background:"none",border:"none",cursor:"pointer"}},"\u2190 Home"))),e("div",{style:{flex:1,padding:"18px 22px",overflowY:"auto",maxHeight:"100vh"}},e("div",{style:{marginBottom:16,display:"flex",alignItems:"center",gap:8}},e("div",{style:{width:8,height:8,borderRadius:"50%",background:curStep.k==="human"?C.am:C.gn}}),e("span",{style:{fontSize:11,color:curStep.k==="human"?C.am:C.gn,textTransform:"uppercase",letterSpacing:1.5,fontFamily:"monospace",fontWeight:600}},"Step "+si+" \u2014 "+curStep.l)),si===0?e(StepUpload,{onComplete:function(pv){sDsId(pv.dataset_id);sDsName(pv.name);go(1)}}):null,si===1?e(StepQuestion,{datasetId:dsId,onProfile:sProfile,onComplete:function(cfg){sConfig(cfg);go(2)}}):null,si===2?e(StepProfile,{profileData:profile}):null,si===3?e(StepExplore,{datasetId:dsId,onData:sExploration}):null,si===4?e(StepReview,{datasetId:dsId,claims:exploration&&exploration.claims?exploration.claims:[],onComplete:function(){go(5)}}):null,si===5?e(StepModel,{datasetId:dsId,onData:sTraining}):null,si===6?e(StepInterpret,{datasetId:dsId}):null,si===7?e(StepProduction,{modelId:training?training.model_id:null,features:training?training.features:null}):null,si>0&&si!==4?e("div",{style:{display:"flex",justifyContent:"space-between",marginTop:18,paddingTop:12,borderTop:"1px solid "+C.bd}},e(Btn,{v:"s",onClick:function(){go(si-1)}},"Back"),si<7?e(Btn,{onClick:function(){go(si+1)}},"Next: "+STEPS[si+1].l+" \u2192"):e("div",{style:{padding:"8px 18px",borderRadius:6,background:C.gn+"15",color:C.gn,fontSize:12,fontWeight:600}},"Pipeline Complete")):null))}
+ReactDOM.createRoot(document.getElementById("root")).render(e(App));
+</script>
+</body>
+</html>
